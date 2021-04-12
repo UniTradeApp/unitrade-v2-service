@@ -115,7 +115,9 @@ export class UniTradeExecutorService {
 
   private executeIfAppropriate = async (order: IUniTradeOrder) => {
     log(`Checking if order ${order.orderId} is executable...`);
-    const isActive = order.orderState == OrderState.Placed;
+
+    // Avoid to try to execute an Executed/Cancelled order
+    const isActive = order.orderState.toString() === OrderState.Placed.toString();
     if (!isActive) {
       log(`Order ${order.orderId} isn't active (current state is ${order.orderState}), ignoring it.`);
       return false;
