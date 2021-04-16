@@ -128,6 +128,7 @@ export class UniTradeExecutorService {
       let estimatedGas;
       try {
         estimatedGas = await this.dependencies.providers.ethGasStation?.getEstimatedGasForOrder(order.orderId);
+        log('Got estimated gas for order %s: %s', order.orderId, estimatedGas);
       } catch (err) {
         log(`Failed order: ${JSON.stringify(order)}`);
         if (this.badOrderMap[order.orderId]) {
@@ -149,10 +150,14 @@ export class UniTradeExecutorService {
         log("Cannot retrieve preferred gas price for order %s", order.orderId);
         return false;
       }
-      const gas = toBN(estimatedGas).mul(toBN(gasPrice));
+
+      const gasSlippage = config.gasLimitSlippage ? parseFloat(config.gasLimitSlippage) : 1;
+      log("Configured gas slippage value: %s", gasSlippage);
+
+      const gas = toBN(estimatedGas * gasSlippage).mul(toBN(gasPrice));
 
       if (gas.lt(toBN(order.executorFee))) {
-        return await this.dependencies.providers.uniTrade?.executeOrder(order, estimatedGas, gasPrice);
+        return await this.dependencies.providers.uniTrade?.executeOrder(order, estimatedGas * gasSlippage, gasPrice);
       } else {
         log(
           "Executor fee for order %s is not high enough to cover the estimated gas cost of executing order (%s < %s)",

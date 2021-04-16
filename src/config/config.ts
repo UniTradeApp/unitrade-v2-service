@@ -19,6 +19,7 @@ export interface IConfig {
   percentSlippage: string;
   gasPriceLevel: string;
   badOrderRetry: string;
+  gasLimitSlippage: string;
 }
 
 const getEnv = (key: string) => {
@@ -47,4 +48,5 @@ export const config: IConfig = {
   percentSlippage: getEnv("PERCENT_SLIPPAGE"),
   gasPriceLevel: getEnv("GAS_PRICE_LEVEL"),
   badOrderRetry: getEnv("BAD_ORDER_RETRY"),
+  gasLimitSlippage: getEnv("GAS_LIMIT_SLIPPAGE"),
 };
