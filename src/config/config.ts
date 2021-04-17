@@ -19,8 +19,14 @@ export interface IConfig {
   percentSlippage: string;
   gasPriceLevel: string;
   badOrderRetry: string;
-  gasLimitSlippage: string;
+  maxFailureCount: string;
+  maxFailureGasCost: string;
+  maxFailureDuration: string;
+  resetTimerOnFailure: string;
+  failureShutdownWebhookUrl: string;
 }
+
+const getOptionalEnv = (key: string) => process.env[key];
 
 const getEnv = (key: string) => {
   const value = process.env[key];
@@ -48,5 +54,9 @@ export const config: IConfig = {
   percentSlippage: getEnv("PERCENT_SLIPPAGE"),
   gasPriceLevel: getEnv("GAS_PRICE_LEVEL"),
   badOrderRetry: getEnv("BAD_ORDER_RETRY"),
-  gasLimitSlippage: getEnv("GAS_LIMIT_SLIPPAGE"),
+  maxFailureCount: getEnv("MAX_FAILURE_COUNT"),
+  maxFailureGasCost: getEnv("MAX_FAILURE_GAS_COST"),
+  maxFailureDuration: getEnv("MAX_FAILURE_DURATION"),
+  resetTimerOnFailure: getOptionalEnv("RESET_TIMER_ON_FAILURE") || "false",
+  failureShutdownWebhookUrl: getOptionalEnv("FAILURE_SHUTDOWN_WEBHOOK_URL") || "",
 };
