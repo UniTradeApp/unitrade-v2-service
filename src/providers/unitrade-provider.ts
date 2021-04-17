@@ -76,8 +76,7 @@ export class UniTradeProvider extends Dependency {
         });
       return true;
     } catch (err) {
-      log("Error executing order %s: %O", order.orderId, err);
-      return false;
+      throw err;
     }
   };
 }
