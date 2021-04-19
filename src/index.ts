@@ -12,23 +12,38 @@ import Web3 from "web3";
 import { config } from "./config";
 import { loader } from "./utils/loader";
 import { TokenPool } from "./lib/classes";
-import { IDependencies, IUniTradeOrder, OrderState } from "./lib/types";
+import { IContractEvent, ExitCodes, IDependencies, IUniTradeOrder, OrderState } from "./lib/types";
 import { toBN } from "web3-utils";
 const log = debug("unitrade-service");
 
 export class UniTradeExecutorService {
   private dependencies: IDependencies;
   private activeOrders: IUniTradeOrder[];
+  private orderLocks: { [key: string]: boolean } = {};
   private badOrderMap: { [key: string]: number } = {};
   private pools: { [pairAddress: string]: TokenPool } = {};
   private poolListeners: { [pairAddress: string]: EventEmitter } = {};
   private orderListeners: { [eventName: string]: EventEmitter } = {};
+  private failureListener: EventEmitter;
+  private failedTxnTimer: any = null;
+  private failedTxnCount: number = 0;
+  private failedTxnGasCost: number = 0;
+
+  /**
+   * Log an error and/or shutdown the service
+   */
+  private handleError(error: Error, exitCode = ExitCodes.GenericError) {
+    log(error);
+    if (exitCode) {
+      this.handleShutdown(exitCode);
+    }
+  }
 
   /**
    * Gracefully handle app shutdown
    * @param exitCode
    */
-  private handleShutdown(exitCode = 0) {
+  private async handleShutdown(exitCode = ExitCodes.Success) {
     try {
       log("Shutting down...");
 
@@ -50,6 +65,22 @@ export class UniTradeExecutorService {
         }
       }
 
+      if (this.failureListener) this.failureListener.removeAllListeners();
+
+      if (exitCode > ExitCodes.GenericError && config.failureShutdownWebhookUrl) {
+        log("Sending shutdown notification to URL: %s", config.failureShutdownWebhookUrl);
+
+        await fetch(config.failureShutdownWebhookUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text: `Executor service has shut down with exit code ${exitCode}`,
+          }),
+        });
+      }
+
       process.exit(exitCode);
     } catch (err) {
       log("Error during shutdown: %O", err);
@@ -58,7 +89,12 @@ export class UniTradeExecutorService {
   }
 
   constructor() {
-    this.start();
+    try {
+      this.start();
+    } catch (err) {
+      log("Error: %O", err);
+      this.handleShutdown(ExitCodes.GenericError);
+    }
     process.on("SIGINT", () => {
       this.handleShutdown();
     });
@@ -66,6 +102,20 @@ export class UniTradeExecutorService {
       this.handleShutdown();
     });
   }
+
+  /**
+   * Lock an order so it's not run twice
+   * @param orderId
+   */
+  private lockOrder = (orderId: number) => (this.orderLocks[orderId] = true);
+
+  /**
+   * Unlock an order for executing
+   * @param orderId
+   */
+  private unlockOrder = (orderId: number) => {
+    if (this.orderLocks[orderId]) delete this.orderLocks[orderId];
+  };
 
   /**
    * Get or Create TokenPool
@@ -90,7 +140,7 @@ export class UniTradeExecutorService {
       const pool = this.getOrCreatePool(pairAddress);
       pool.addOrder(orderId, order);
     } catch (err) {
-      log("%O", err);
+      this.handleError(err, ExitCodes.GenericError);
     }
   };
 
@@ -109,25 +159,34 @@ export class UniTradeExecutorService {
         orderPool.removeOrder(orderId);
       }
     } catch (err) {
-      log("%O", err);
+      this.handleError(err, ExitCodes.GenericError);
     }
   };
 
   private executeIfAppropriate = async (order: IUniTradeOrder) => {
+    if (this.orderLocks[order.orderId]) return false;
+
     log(`Checking if order ${order.orderId} is executable...`);
 
     // Avoid to try to execute an Executed/Cancelled order
-    const isActive = order.orderState.toString() === OrderState.Placed.toString();
+    const isActive = order.orderState == OrderState.Placed;
     if (!isActive) {
       log(`Order ${order.orderId} isn't active (current state is ${order.orderState}), ignoring it.`);
       return false;
     }
 
+    // lock the order so it doesn't get processed multiple times
+    this.lockOrder(order.orderId);
+
     const inTheMoney = await this.dependencies.providers.uniSwap?.isInTheMoney(order);
     if (inTheMoney) {
       let estimatedGas;
       try {
-        estimatedGas = await this.dependencies.providers.ethGasStation?.getEstimatedGasForOrder(order.orderId);
+        // override the estimated gas for debugging purposes
+        estimatedGas = process.env.ESTIMATED_GAS_OVERRIDE
+          ? parseInt(process.env.ESTIMATED_GAS_OVERRIDE, 10)
+          : await this.dependencies.providers.ethGasStation?.getEstimatedGasForOrder(order.orderId);
+        log("Got estimated gas for order %s: %s", order.orderId, estimatedGas);
       } catch (err) {
         log(`Failed order: ${JSON.stringify(order)}`);
         if (this.badOrderMap[order.orderId]) {
@@ -142,17 +201,26 @@ export class UniTradeExecutorService {
       }
       if (!estimatedGas) {
         log("Cannot retrieve preferred estimated gas for order %s", order.orderId);
+        this.unlockOrder(order.orderId);
         return false;
       }
       const gasPrice = this.dependencies.providers.ethGasStation?.getPreferredGasPrice();
       if (!gasPrice) {
         log("Cannot retrieve preferred gas price for order %s", order.orderId);
+        this.unlockOrder(order.orderId);
         return false;
       }
+
       const gas = toBN(estimatedGas).mul(toBN(gasPrice));
 
       if (gas.lt(toBN(order.executorFee))) {
-        return await this.dependencies.providers.uniTrade?.executeOrder(order, estimatedGas, gasPrice);
+        try {
+          return await this.dependencies.providers.uniTrade?.executeOrder(order, estimatedGas, gasPrice);
+        } catch (err) {
+          this.handleFailedExecution(err.receipt);
+          this.unlockOrder(order.orderId);
+          return false;
+        }
       } else {
         log(
           "Executor fee for order %s is not high enough to cover the estimated gas cost of executing order (%s < %s)",
@@ -163,7 +231,55 @@ export class UniTradeExecutorService {
       }
     }
     log(`Order ${order.orderId} isn't "In the money" ignoring it...`);
+    this.unlockOrder(order.orderId);
     return false;
+  };
+
+  /**
+   * Handle failures and shut down if necessary
+   * @param receipt
+   * @returns
+   */
+  private handleFailedExecution = (receipt: any) => {
+    if (!receipt) return;
+
+    this.failedTxnCount += 1;
+    this.failedTxnGasCost += receipt.gasUsed || 0;
+
+    log(
+      "Transaction %s failed!\n\nFailed txns: %s/%s\nFailed txn gas cost: %s/%s\n\n",
+      receipt.transactionHash,
+      this.failedTxnCount,
+      config.maxFailureCount,
+      this.failedTxnGasCost,
+      config.maxFailureGasCost
+    );
+
+    if (config.maxFailureCount && this.failedTxnCount >= parseInt(config.maxFailureCount)) {
+      this.handleError(
+        new Error("Number of failed transactions is over the limit - service is shutting down"),
+        ExitCodes.TooManyFailures
+      );
+    }
+    if (config.maxFailureGasCost && this.failedTxnGasCost >= parseInt(config.maxFailureGasCost)) {
+      this.handleError(
+        new Error("Gas cost of failed transactions is over the limit - service is shutting down"),
+        ExitCodes.TooMuchGasLost
+      );
+    }
+
+    // set the timer
+    if (config.maxFailureDuration) {
+      if (!this.failedTxnTimer || config.resetTimerOnFailure?.toLowerCase() === "true") {
+        log("Setting failed transaction timer with duration %s ms", config.maxFailureDuration);
+        this.failedTxnTimer = setTimeout(() => {
+          log("Failed transactions timer expired - resetting failed transaction count");
+          this.failedTxnCount = 0;
+          this.failedTxnGasCost = 0;
+          this.failedTxnTimer = null;
+        }, parseInt(config.maxFailureDuration));
+      }
+    }
   };
 
   /**
@@ -203,14 +319,14 @@ export class UniTradeExecutorService {
         log("Listener connected to UniSwap Sync events for pairAddress %s", pairAddress);
       });
       this.poolListeners[pairAddress].on("error", (err) => {
-        log(err);
+        this.handleError(err, ExitCodes.GenericError);
       });
       this.poolListeners[pairAddress].on("end", async () => {
         log("Listener lost connection to UniSwap Sync events for pairAddress %s! Reconnecting...", pairAddress);
         this.createPoolChangeListener(pairAddress);
       });
     } catch (err) {
-      log("%O", err);
+      this.handleError(err, ExitCodes.GenericError);
     }
   };
 
@@ -242,14 +358,14 @@ export class UniTradeExecutorService {
         log("Listener connected to UniTrade OrderPlaced events");
       });
       this.orderListeners.OrderPlaced.on("error", (err) => {
-        log(err);
+        this.handleError(err, ExitCodes.GenericError);
       });
       this.orderListeners.OrderPlaced.on("end", async () => {
         log("Listener disconnected from UniTrade OrderPlaced events!");
         this.createOrderPlacedListener();
       });
     } catch (err) {
-      throw err;
+      this.handleError(err, ExitCodes.GenericError);
     }
   };
 
@@ -267,7 +383,7 @@ export class UniTradeExecutorService {
 
       this.orderListeners.OrderCancelled = await uniTradeEvents.OrderCancelled((err: Error) => {
         if (err) {
-          log(err);
+          this.handleError(err, ExitCodes.GenericError);
           return;
         }
       });
@@ -294,14 +410,14 @@ export class UniTradeExecutorService {
         log("Listener connected to UniTrade OrderCancelled events");
       });
       this.orderListeners.OrderCancelled.on("error", (err) => {
-        log(err);
+        this.handleError(err, ExitCodes.GenericError);
       });
       this.orderListeners.OrderCancelled.on("end", async () => {
         log("Listener disconnected from UniTrade OrderCancelled events!");
         this.createOrderCancelledListener();
       });
     } catch (err) {
-      throw err;
+      this.handleError(err, ExitCodes.GenericError);
     }
   };
 
@@ -319,12 +435,31 @@ export class UniTradeExecutorService {
 
       this.orderListeners.OrderExecuted = await uniTradeEvents.OrderExecuted((err: Error) => {
         if (err) {
-          log(err);
+          this.handleError(err, ExitCodes.GenericError);
           return;
         }
       });
-      this.orderListeners.OrderExecuted.on("data", async (event: any) => {
-        if (event.returnValues) {
+      this.orderListeners.OrderExecuted.on("data", async (event: IContractEvent) => {
+        // did the execution attempt fail?
+        const receipt = await this.dependencies.providers.uniTrade?.web3.eth.getTransactionReceipt(
+          event.transactionHash
+        );
+
+        log("Got receipt for event %O: %O", event, receipt);
+
+        // if (receipt === null) {
+        //   this.pendingExecutions.push(event.transactionHash);
+        //   if (!this.pendingExecutionChecker) {
+        //     this.checkPendingExecutions();
+        //     this.pendingExecutionChecker = setInterval(() => {
+        //       this.checkPendingExecutions();
+        //     }, this.pendingExecutionInterval);
+        //   }
+        // }
+
+        if (receipt && !receipt.status) {
+          this.handleFailedExecution(event.transactionHash);
+        } else if (event.returnValues) {
           log("Received UniTrade OrderExecuted event for orderId: %s", event.returnValues.orderId);
           const order = event.returnValues as IUniTradeOrder;
           this.removePoolOrder(order.orderId, order);
@@ -345,14 +480,14 @@ export class UniTradeExecutorService {
         log("Listener connected to UniTrade OrderExecuted events");
       });
       this.orderListeners.OrderExecuted.on("error", (err) => {
-        log(err);
+        this.handleError(err, ExitCodes.GenericError);
       });
       this.orderListeners.OrderExecuted.on("end", async () => {
         log("Listener disconnected from UniTrade OrderExecuted events!");
         this.createOrderExecutedListener();
       });
     } catch (err) {
-      throw err;
+      this.handleError(err, ExitCodes.GenericError);
     }
   };
 
@@ -366,6 +501,12 @@ export class UniTradeExecutorService {
       const web3 = new Web3(config.provider.uri);
 
       this.dependencies = loader(web3);
+
+      if (!this.dependencies.providers.uniSwap) throw new Error("UniSwap Provider not loaded! Shutting down...");
+      else if (!this.dependencies.providers.uniTrade) throw new Error("UniTrade Provider not loaded! Shutting down...");
+      else if (!this.dependencies.providers.account) throw new Error("Account Provider not loaded! Shutting down...");
+      else if (!this.dependencies.providers.ethGasStation)
+        throw new Error("EthGasStation Provider not loaded! Shutting down...");
 
       this.activeOrders = (await this.dependencies.providers.uniTrade?.listOrders()) || [];
 
@@ -384,10 +525,11 @@ export class UniTradeExecutorService {
       await this.createOrderPlacedListener();
       await this.createOrderCancelledListener();
       await this.createOrderExecutedListener();
+      // await this.createFailedTxnListener();
 
       log("UniTrade executor service is now running!");
     } catch (err) {
-      log("%O", err);
+      this.handleError(err, ExitCodes.GenericError);
     }
   }
 }

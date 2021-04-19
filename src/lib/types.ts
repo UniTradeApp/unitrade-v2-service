@@ -1,5 +1,12 @@
 import { UniTradeProvider, UniSwapProvider, AccountProvider, EthGasStationProvider } from "../providers";
 
+export enum ExitCodes {
+  Success = 0,
+  GenericError = 1,
+  TooManyFailures = 2,
+  TooMuchGasLost = 3,
+}
+
 /**
  * Dependencies
  */
@@ -9,6 +16,25 @@ export class IDependencies {
     uniTrade?: UniTradeProvider;
     uniSwap?: UniSwapProvider;
     ethGasStation?: EthGasStationProvider;
+  };
+}
+
+/**
+ * Contract Events
+ */
+export interface IContractEvent {
+  event: string;
+  signature: string | null;
+  address: string;
+  returnValues?: { [key: string]: any };
+  logIndex: number;
+  transactionIndex: number;
+  transactionHash: string;
+  blockHash: string;
+  blockNumber: number;
+  raw: {
+    data: string;
+    topics: string[];
   };
 }
 
