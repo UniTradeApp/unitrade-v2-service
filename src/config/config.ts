@@ -54,9 +54,9 @@ export const config: IConfig = {
   percentSlippage: getEnv("PERCENT_SLIPPAGE"),
   gasPriceLevel: getEnv("GAS_PRICE_LEVEL"),
   badOrderRetry: getEnv("BAD_ORDER_RETRY"),
-  maxFailureCount: getEnv("MAX_FAILURE_COUNT"),
-  maxFailureGasCost: getEnv("MAX_FAILURE_GAS_COST"),
-  maxFailureDuration: getEnv("MAX_FAILURE_DURATION"),
+  maxFailureCount: getOptionalEnv("MAX_FAILURE_COUNT") || "",
+  maxFailureGasCost: getOptionalEnv("MAX_FAILURE_GAS_COST") || "",
+  maxFailureDuration: getOptionalEnv("MAX_FAILURE_DURATION") || "",
   resetTimerOnFailure: getOptionalEnv("RESET_TIMER_ON_FAILURE") || "false",
   failureShutdownWebhookUrl: getOptionalEnv("FAILURE_SHUTDOWN_WEBHOOK_URL") || "",
 };

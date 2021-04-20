@@ -107,14 +107,18 @@ export class UniTradeExecutorService {
    * Lock an order so it's not run twice
    * @param orderId
    */
-  private lockOrder = (orderId: number) => (this.orderLocks[orderId] = true);
-
+  private lockOrder = (orderId: number) => {
+    this.orderLocks[orderId] = true;
+    log("Locked order %s", orderId);
+  };
+  
   /**
    * Unlock an order for executing
    * @param orderId
    */
   private unlockOrder = (orderId: number) => {
     if (this.orderLocks[orderId]) delete this.orderLocks[orderId];
+    log("Unlocked order %s", orderId);
   };
 
   /**
@@ -255,13 +259,13 @@ export class UniTradeExecutorService {
       config.maxFailureGasCost
     );
 
-    if (config.maxFailureCount && this.failedTxnCount >= parseInt(config.maxFailureCount)) {
+    if (config.maxFailureCount && this.failedTxnCount > parseInt(config.maxFailureCount)) {
       this.handleError(
         new Error("Number of failed transactions is over the limit - service is shutting down"),
         ExitCodes.TooManyFailures
       );
     }
-    if (config.maxFailureGasCost && this.failedTxnGasCost >= parseInt(config.maxFailureGasCost)) {
+    if (config.maxFailureGasCost && this.failedTxnGasCost > parseInt(config.maxFailureGasCost)) {
       this.handleError(
         new Error("Gas cost of failed transactions is over the limit - service is shutting down"),
         ExitCodes.TooMuchGasLost
@@ -447,16 +451,6 @@ export class UniTradeExecutorService {
 
         log("Got receipt for event %O: %O", event, receipt);
 
-        // if (receipt === null) {
-        //   this.pendingExecutions.push(event.transactionHash);
-        //   if (!this.pendingExecutionChecker) {
-        //     this.checkPendingExecutions();
-        //     this.pendingExecutionChecker = setInterval(() => {
-        //       this.checkPendingExecutions();
-        //     }, this.pendingExecutionInterval);
-        //   }
-        // }
-
         if (receipt && !receipt.status) {
           this.handleFailedExecution(event.transactionHash);
         } else if (event.returnValues) {
@@ -525,7 +519,6 @@ export class UniTradeExecutorService {
       await this.createOrderPlacedListener();
       await this.createOrderCancelledListener();
       await this.createOrderExecutedListener();
-      // await this.createFailedTxnListener();
 
       log("UniTrade executor service is now running!");
     } catch (err) {
